@@ -710,6 +710,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
+        # cron.* from config.yaml when env not set (dotenv / shell still wins).
+        _cron_yaml = _cfg.get("cron") if isinstance(_cfg.get("cron"), dict) else {}
+        if _cron_yaml:
+            if "HERMES_CRON_TIMEOUT" not in os.environ and "idle_timeout" in _cron_yaml:
+                os.environ["HERMES_CRON_TIMEOUT"] = str(_cron_yaml["idle_timeout"])
+            if "HERMES_STREAM_HEARTBEAT_INTERVAL" not in os.environ and "heartbeat_interval" in _cron_yaml:
+                os.environ["HERMES_STREAM_HEARTBEAT_INTERVAL"] = str(
+                    _cron_yaml["heartbeat_interval"]
+                )
+
         # Apply IPv4 preference if configured.
         try:
             from hermes_constants import apply_ipv4_preference

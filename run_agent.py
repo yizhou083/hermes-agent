@@ -35,6 +35,7 @@ import sys
 import tempfile
 import time
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 import uuid
 from typing import List, Dict, Any, Optional
@@ -607,6 +608,7 @@ class AIAgent:
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
         persist_session: bool = True,
+        stream_heartbeat_interval: Optional[float] = None,
     ):
         """
         Initialize the AI Agent.
@@ -674,6 +676,15 @@ class AIAgent:
         self.skip_context_files = skip_context_files
         self.pass_session_id = pass_session_id
         self.persist_session = persist_session
+        if stream_heartbeat_interval is None:
+            _raw_sh = os.getenv("HERMES_STREAM_HEARTBEAT_INTERVAL", "30").strip()
+            try:
+                _parsed_sh = float(_raw_sh)
+            except ValueError:
+                _parsed_sh = 30.0
+        else:
+            _parsed_sh = float(stream_heartbeat_interval)
+        self._stream_heartbeat_interval: float = _parsed_sh if _parsed_sh > 0 else 0.0
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -3162,6 +3173,44 @@ class AIAgent:
         self._last_activity_ts = time.time()
         self._last_activity_desc = desc
 
+    @contextmanager
+    def _stream_heartbeat_scope(self):
+        """Refresh inactivity timer while blocked on a sparse streaming iterator.
+
+        Cron and gateway treat long gaps with no tool/API activity as idle.
+        Some providers buffer tokens server-side; this thread wakes every
+        ``_stream_heartbeat_interval`` seconds and calls ``_touch_activity`` so
+        legitimate long streams are not killed mid-generation.
+        """
+        interval = getattr(self, "_stream_heartbeat_interval", 0.0) or 0.0
+        if interval <= 0:
+            yield
+            return
+        stop = threading.Event()
+
+        def _loop():
+            while not stop.wait(interval):
+                if self._interrupt_requested:
+                    break
+                self._touch_activity("stream heartbeat (idle window)")
+                logger.debug(
+                    "Stream heartbeat tick (interval=%.1fs) %s",
+                    interval,
+                    self.log_prefix.rstrip(),
+                )
+
+        th = threading.Thread(
+            target=_loop,
+            name="hermes-stream-heartbeat",
+            daemon=True,
+        )
+        th.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            th.join(timeout=min(interval + 2.0, 8.0))
+
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
 
@@ -4701,54 +4750,55 @@ class AIAgent:
             collected_output_items: list = []
             try:
                 with active_client.responses.stream(**api_kwargs) as stream:
-                    for event in stream:
-                        self._touch_activity("receiving stream response")
-                        if self._interrupt_requested:
-                            break
-                        event_type = getattr(event, "type", "")
-                        # Fire callbacks on text content deltas (suppress during tool calls)
-                        if "output_text.delta" in event_type or event_type == "response.output_text.delta":
-                            delta_text = getattr(event, "delta", "")
-                            if delta_text:
-                                self._codex_streamed_text_parts.append(delta_text)
-                            if delta_text and not has_tool_calls:
-                                if not first_delta_fired:
-                                    first_delta_fired = True
-                                    if on_first_delta:
-                                        try:
-                                            on_first_delta()
-                                        except Exception:
-                                            pass
-                                self._fire_stream_delta(delta_text)
-                        # Track tool calls to suppress text streaming
-                        elif "function_call" in event_type:
-                            has_tool_calls = True
-                        # Fire reasoning callbacks
-                        elif "reasoning" in event_type and "delta" in event_type:
-                            reasoning_text = getattr(event, "delta", "")
-                            if reasoning_text:
-                                self._fire_reasoning_delta(reasoning_text)
-                        # Collect completed output items — some backends
-                        # (chatgpt.com/backend-api/codex) stream valid items
-                        # via response.output_item.done but the SDK's
-                        # get_final_response() returns an empty output list.
-                        elif event_type == "response.output_item.done":
-                            done_item = getattr(event, "item", None)
-                            if done_item is not None:
-                                collected_output_items.append(done_item)
-                        # Log non-completed terminal events for diagnostics
-                        elif event_type in ("response.incomplete", "response.failed"):
-                            resp_obj = getattr(event, "response", None)
-                            status = getattr(resp_obj, "status", None) if resp_obj else None
-                            incomplete_details = getattr(resp_obj, "incomplete_details", None) if resp_obj else None
-                            logger.warning(
-                                "Codex Responses stream received terminal event %s "
-                                "(status=%s, incomplete_details=%s, streamed_chars=%d). %s",
-                                event_type, status, incomplete_details,
-                                sum(len(p) for p in self._codex_streamed_text_parts),
-                                self._client_log_context(),
-                            )
-                    final_response = stream.get_final_response()
+                    with self._stream_heartbeat_scope():
+                        for event in stream:
+                            self._touch_activity("receiving stream response")
+                            if self._interrupt_requested:
+                                break
+                            event_type = getattr(event, "type", "")
+                            # Fire callbacks on text content deltas (suppress during tool calls)
+                            if "output_text.delta" in event_type or event_type == "response.output_text.delta":
+                                delta_text = getattr(event, "delta", "")
+                                if delta_text:
+                                    self._codex_streamed_text_parts.append(delta_text)
+                                if delta_text and not has_tool_calls:
+                                    if not first_delta_fired:
+                                        first_delta_fired = True
+                                        if on_first_delta:
+                                            try:
+                                                on_first_delta()
+                                            except Exception:
+                                                pass
+                                    self._fire_stream_delta(delta_text)
+                            # Track tool calls to suppress text streaming
+                            elif "function_call" in event_type:
+                                has_tool_calls = True
+                            # Fire reasoning callbacks
+                            elif "reasoning" in event_type and "delta" in event_type:
+                                reasoning_text = getattr(event, "delta", "")
+                                if reasoning_text:
+                                    self._fire_reasoning_delta(reasoning_text)
+                            # Collect completed output items — some backends
+                            # (chatgpt.com/backend-api/codex) stream valid items
+                            # via response.output_item.done but the SDK's
+                            # get_final_response() returns an empty output list.
+                            elif event_type == "response.output_item.done":
+                                done_item = getattr(event, "item", None)
+                                if done_item is not None:
+                                    collected_output_items.append(done_item)
+                            # Log non-completed terminal events for diagnostics
+                            elif event_type in ("response.incomplete", "response.failed"):
+                                resp_obj = getattr(event, "response", None)
+                                status = getattr(resp_obj, "status", None) if resp_obj else None
+                                incomplete_details = getattr(resp_obj, "incomplete_details", None) if resp_obj else None
+                                logger.warning(
+                                    "Codex Responses stream received terminal event %s "
+                                    "(status=%s, incomplete_details=%s, streamed_chars=%d). %s",
+                                    event_type, status, incomplete_details,
+                                    sum(len(p) for p in self._codex_streamed_text_parts),
+                                    self._client_log_context(),
+                                )
+                        final_response = stream.get_final_response()
                     # PATCH: ChatGPT Codex backend streams valid output items
                     # but get_final_response() can return an empty output list.
                     # Backfill from collected items or synthesize from deltas.
@@ -4826,54 +4876,55 @@ class AIAgent:
         collected_output_items: list = []
         collected_text_deltas: list = []
         try:
-            for event in stream_or_response:
-                self._touch_activity("receiving stream response")
-                event_type = getattr(event, "type", None)
-                if not event_type and isinstance(event, dict):
-                    event_type = event.get("type")
+            with self._stream_heartbeat_scope():
+                for event in stream_or_response:
+                    self._touch_activity("receiving stream response")
+                    event_type = getattr(event, "type", None)
+                    if not event_type and isinstance(event, dict):
+                        event_type = event.get("type")
 
-                # Collect output items and text deltas for backfill
-                if event_type == "response.output_item.done":
-                    done_item = getattr(event, "item", None)
-                    if done_item is None and isinstance(event, dict):
-                        done_item = event.get("item")
-                    if done_item is not None:
-                        collected_output_items.append(done_item)
-                elif event_type in ("response.output_text.delta",):
-                    delta = getattr(event, "delta", "")
-                    if not delta and isinstance(event, dict):
-                        delta = event.get("delta", "")
-                    if delta:
-                        collected_text_deltas.append(delta)
+                    # Collect output items and text deltas for backfill
+                    if event_type == "response.output_item.done":
+                        done_item = getattr(event, "item", None)
+                        if done_item is None and isinstance(event, dict):
+                            done_item = event.get("item")
+                        if done_item is not None:
+                            collected_output_items.append(done_item)
+                    elif event_type in ("response.output_text.delta",):
+                        delta = getattr(event, "delta", "")
+                        if not delta and isinstance(event, dict):
+                            delta = event.get("delta", "")
+                        if delta:
+                            collected_text_deltas.append(delta)
 
-                if event_type not in {"response.completed", "response.incomplete", "response.failed"}:
-                    continue
+                    if event_type not in {"response.completed", "response.incomplete", "response.failed"}:
+                        continue
 
-                terminal_response = getattr(event, "response", None)
-                if terminal_response is None and isinstance(event, dict):
-                    terminal_response = event.get("response")
-                if terminal_response is not None:
-                    # Backfill empty output from collected stream events
-                    _out = getattr(terminal_response, "output", None)
-                    if isinstance(_out, list) and not _out:
-                        if collected_output_items:
-                            terminal_response.output = list(collected_output_items)
-                            logger.debug(
-                                "Codex fallback stream: backfilled %d output items",
-                                len(collected_output_items),
-                            )
-                        elif collected_text_deltas:
-                            assembled = "".join(collected_text_deltas)
-                            terminal_response.output = [SimpleNamespace(
-                                type="message", role="assistant",
-                                status="completed",
-                                content=[SimpleNamespace(type="output_text", text=assembled)],
-                            )]
-                            logger.debug(
-                                "Codex fallback stream: synthesized from %d deltas (%d chars)",
-                                len(collected_text_deltas), len(assembled),
-                            )
-                    return terminal_response
+                    terminal_response = getattr(event, "response", None)
+                    if terminal_response is None and isinstance(event, dict):
+                        terminal_response = event.get("response")
+                    if terminal_response is not None:
+                        # Backfill empty output from collected stream events
+                        _out = getattr(terminal_response, "output", None)
+                        if isinstance(_out, list) and not _out:
+                            if collected_output_items:
+                                terminal_response.output = list(collected_output_items)
+                                logger.debug(
+                                    "Codex fallback stream: backfilled %d output items",
+                                    len(collected_output_items),
+                                )
+                            elif collected_text_deltas:
+                                assembled = "".join(collected_text_deltas)
+                                terminal_response.output = [SimpleNamespace(
+                                    type="message", role="assistant",
+                                    status="completed",
+                                    content=[SimpleNamespace(type="output_text", text=assembled)],
+                                )]
+                                logger.debug(
+                                    "Codex fallback stream: synthesized from %d deltas (%d chars)",
+                                    len(collected_text_deltas), len(assembled),
+                                )
+                        return terminal_response
         finally:
             close_fn = getattr(stream_or_response, "close", None)
             if callable(close_fn):
@@ -5450,11 +5501,12 @@ class AIAgent:
                     result["error"] = e
 
             t = threading.Thread(target=_bedrock_call, daemon=True)
-            t.start()
-            while t.is_alive():
-                t.join(timeout=0.3)
-                if self._interrupt_requested:
-                    raise InterruptedError("Agent interrupted during Bedrock API call")
+            with self._stream_heartbeat_scope():
+                t.start()
+                while t.is_alive():
+                    t.join(timeout=0.3)
+                    if self._interrupt_requested:
+                        raise InterruptedError("Agent interrupted during Bedrock API call")
             if result["error"] is not None:
                 raise result["error"]
             return result["response"]
@@ -5530,114 +5582,115 @@ class AIAgent:
             role = "assistant"
             reasoning_parts: list = []
             usage_obj = None
-            for chunk in stream:
-                last_chunk_time["t"] = time.time()
-                self._touch_activity("receiving stream response")
+            with self._stream_heartbeat_scope():
+                for chunk in stream:
+                    last_chunk_time["t"] = time.time()
+                    self._touch_activity("receiving stream response")
 
-                if self._interrupt_requested:
-                    break
+                    if self._interrupt_requested:
+                        break
 
-                if not chunk.choices:
+                    if not chunk.choices:
+                        if hasattr(chunk, "model") and chunk.model:
+                            model_name = chunk.model
+                        # Usage comes in the final chunk with empty choices
+                        if hasattr(chunk, "usage") and chunk.usage:
+                            usage_obj = chunk.usage
+                        continue
+
+                    delta = chunk.choices[0].delta
                     if hasattr(chunk, "model") and chunk.model:
                         model_name = chunk.model
-                    # Usage comes in the final chunk with empty choices
+
+                    # Accumulate reasoning content
+                    reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                    if reasoning_text:
+                        reasoning_parts.append(reasoning_text)
+                        _fire_first_delta()
+                        self._fire_reasoning_delta(reasoning_text)
+
+                    # Accumulate text content — fire callback only when no tool calls
+                    if delta and delta.content:
+                        content_parts.append(delta.content)
+                        if not tool_calls_acc:
+                            _fire_first_delta()
+                            self._fire_stream_delta(delta.content)
+                            deltas_were_sent["yes"] = True
+                        else:
+                            # Tool calls suppress regular content streaming (avoids
+                            # displaying chatty "I'll use the tool..." text alongside
+                            # tool calls).  But reasoning tags embedded in suppressed
+                            # content should still reach the display — otherwise the
+                            # reasoning box only appears as a post-response fallback,
+                            # rendering it confusingly after the already-streamed
+                            # response.  Route suppressed content through the stream
+                            # delta callback so its tag extraction can fire the
+                            # reasoning display.  Non-reasoning text is harmlessly
+                            # suppressed by the CLI's _stream_delta when the stream
+                            # box is already closed (tool boundary flush).
+                            if self.stream_delta_callback:
+                                try:
+                                    self.stream_delta_callback(delta.content)
+                                    self._record_streamed_assistant_text(delta.content)
+                                except Exception:
+                                    pass
+
+                    # Accumulate tool call deltas — notify display on first name
+                    if delta and delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            raw_idx = tc_delta.index if tc_delta.index is not None else 0
+                            delta_id = tc_delta.id or ""
+
+                            # Ollama fix: detect a new tool call reusing the same
+                            # raw index (different id) and redirect to a fresh slot.
+                            if raw_idx not in _active_slot_by_idx:
+                                _active_slot_by_idx[raw_idx] = raw_idx
+                            if (
+                                delta_id
+                                and raw_idx in _last_id_at_idx
+                                and delta_id != _last_id_at_idx[raw_idx]
+                            ):
+                                new_slot = max(tool_calls_acc, default=-1) + 1
+                                _active_slot_by_idx[raw_idx] = new_slot
+                            if delta_id:
+                                _last_id_at_idx[raw_idx] = delta_id
+                            idx = _active_slot_by_idx[raw_idx]
+
+                            if idx not in tool_calls_acc:
+                                tool_calls_acc[idx] = {
+                                    "id": tc_delta.id or "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                    "extra_content": None,
+                                }
+                            entry = tool_calls_acc[idx]
+                            if tc_delta.id:
+                                entry["id"] = tc_delta.id
+                            if tc_delta.function:
+                                if tc_delta.function.name:
+                                    entry["function"]["name"] += tc_delta.function.name
+                                if tc_delta.function.arguments:
+                                    entry["function"]["arguments"] += tc_delta.function.arguments
+                            extra = getattr(tc_delta, "extra_content", None)
+                            if extra is None and hasattr(tc_delta, "model_extra"):
+                                extra = (tc_delta.model_extra or {}).get("extra_content")
+                            if extra is not None:
+                                if hasattr(extra, "model_dump"):
+                                    extra = extra.model_dump()
+                                entry["extra_content"] = extra
+                            # Fire once per tool when the full name is available
+                            name = entry["function"]["name"]
+                            if name and idx not in tool_gen_notified:
+                                tool_gen_notified.add(idx)
+                                _fire_first_delta()
+                                self._fire_tool_gen_started(name)
+
+                    if chunk.choices[0].finish_reason:
+                        finish_reason = chunk.choices[0].finish_reason
+
+                    # Usage in the final chunk
                     if hasattr(chunk, "usage") and chunk.usage:
                         usage_obj = chunk.usage
-                    continue
-
-                delta = chunk.choices[0].delta
-                if hasattr(chunk, "model") and chunk.model:
-                    model_name = chunk.model
-
-                # Accumulate reasoning content
-                reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
-                if reasoning_text:
-                    reasoning_parts.append(reasoning_text)
-                    _fire_first_delta()
-                    self._fire_reasoning_delta(reasoning_text)
-
-                # Accumulate text content — fire callback only when no tool calls
-                if delta and delta.content:
-                    content_parts.append(delta.content)
-                    if not tool_calls_acc:
-                        _fire_first_delta()
-                        self._fire_stream_delta(delta.content)
-                        deltas_were_sent["yes"] = True
-                    else:
-                        # Tool calls suppress regular content streaming (avoids
-                        # displaying chatty "I'll use the tool..." text alongside
-                        # tool calls).  But reasoning tags embedded in suppressed
-                        # content should still reach the display — otherwise the
-                        # reasoning box only appears as a post-response fallback,
-                        # rendering it confusingly after the already-streamed
-                        # response.  Route suppressed content through the stream
-                        # delta callback so its tag extraction can fire the
-                        # reasoning display.  Non-reasoning text is harmlessly
-                        # suppressed by the CLI's _stream_delta when the stream
-                        # box is already closed (tool boundary flush).
-                        if self.stream_delta_callback:
-                            try:
-                                self.stream_delta_callback(delta.content)
-                                self._record_streamed_assistant_text(delta.content)
-                            except Exception:
-                                pass
-
-                # Accumulate tool call deltas — notify display on first name
-                if delta and delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        raw_idx = tc_delta.index if tc_delta.index is not None else 0
-                        delta_id = tc_delta.id or ""
-
-                        # Ollama fix: detect a new tool call reusing the same
-                        # raw index (different id) and redirect to a fresh slot.
-                        if raw_idx not in _active_slot_by_idx:
-                            _active_slot_by_idx[raw_idx] = raw_idx
-                        if (
-                            delta_id
-                            and raw_idx in _last_id_at_idx
-                            and delta_id != _last_id_at_idx[raw_idx]
-                        ):
-                            new_slot = max(tool_calls_acc, default=-1) + 1
-                            _active_slot_by_idx[raw_idx] = new_slot
-                        if delta_id:
-                            _last_id_at_idx[raw_idx] = delta_id
-                        idx = _active_slot_by_idx[raw_idx]
-
-                        if idx not in tool_calls_acc:
-                            tool_calls_acc[idx] = {
-                                "id": tc_delta.id or "",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                                "extra_content": None,
-                            }
-                        entry = tool_calls_acc[idx]
-                        if tc_delta.id:
-                            entry["id"] = tc_delta.id
-                        if tc_delta.function:
-                            if tc_delta.function.name:
-                                entry["function"]["name"] += tc_delta.function.name
-                            if tc_delta.function.arguments:
-                                entry["function"]["arguments"] += tc_delta.function.arguments
-                        extra = getattr(tc_delta, "extra_content", None)
-                        if extra is None and hasattr(tc_delta, "model_extra"):
-                            extra = (tc_delta.model_extra or {}).get("extra_content")
-                        if extra is not None:
-                            if hasattr(extra, "model_dump"):
-                                extra = extra.model_dump()
-                            entry["extra_content"] = extra
-                        # Fire once per tool when the full name is available
-                        name = entry["function"]["name"]
-                        if name and idx not in tool_gen_notified:
-                            tool_gen_notified.add(idx)
-                            _fire_first_delta()
-                            self._fire_tool_gen_started(name)
-
-                if chunk.choices[0].finish_reason:
-                    finish_reason = chunk.choices[0].finish_reason
-
-                # Usage in the final chunk
-                if hasattr(chunk, "usage") and chunk.usage:
-                    usage_obj = chunk.usage
 
             # Build mock response matching non-streaming shape
             full_content = "".join(content_parts) or None
@@ -5700,45 +5753,46 @@ class AIAgent:
             last_chunk_time["t"] = time.time()
             # Use the Anthropic SDK's streaming context manager
             with self._anthropic_client.messages.stream(**api_kwargs) as stream:
-                for event in stream:
-                    # Update stale-stream timer on every event so the
-                    # outer poll loop knows data is flowing.  Without
-                    # this, the detector kills healthy long-running
-                    # Opus streams after 180 s even when events are
-                    # actively arriving (the chat_completions path
-                    # already does this at the top of its chunk loop).
-                    last_chunk_time["t"] = time.time()
-                    self._touch_activity("receiving stream response")
+                with self._stream_heartbeat_scope():
+                    for event in stream:
+                        # Update stale-stream timer on every event so the
+                        # outer poll loop knows data is flowing.  Without
+                        # this, the detector kills healthy long-running
+                        # Opus streams after 180 s even when events are
+                        # actively arriving (the chat_completions path
+                        # already does this at the top of its chunk loop).
+                        last_chunk_time["t"] = time.time()
+                        self._touch_activity("receiving stream response")
 
-                    if self._interrupt_requested:
-                        break
+                        if self._interrupt_requested:
+                            break
 
-                    event_type = getattr(event, "type", None)
+                        event_type = getattr(event, "type", None)
 
-                    if event_type == "content_block_start":
-                        block = getattr(event, "content_block", None)
-                        if block and getattr(block, "type", None) == "tool_use":
-                            has_tool_use = True
-                            tool_name = getattr(block, "name", None)
-                            if tool_name:
-                                _fire_first_delta()
-                                self._fire_tool_gen_started(tool_name)
-
-                    elif event_type == "content_block_delta":
-                        delta = getattr(event, "delta", None)
-                        if delta:
-                            delta_type = getattr(delta, "type", None)
-                            if delta_type == "text_delta":
-                                text = getattr(delta, "text", "")
-                                if text and not has_tool_use:
+                        if event_type == "content_block_start":
+                            block = getattr(event, "content_block", None)
+                            if block and getattr(block, "type", None) == "tool_use":
+                                has_tool_use = True
+                                tool_name = getattr(block, "name", None)
+                                if tool_name:
                                     _fire_first_delta()
-                                    self._fire_stream_delta(text)
-                                    deltas_were_sent["yes"] = True
-                            elif delta_type == "thinking_delta":
-                                thinking_text = getattr(delta, "thinking", "")
-                                if thinking_text:
-                                    _fire_first_delta()
-                                    self._fire_reasoning_delta(thinking_text)
+                                    self._fire_tool_gen_started(tool_name)
+
+                        elif event_type == "content_block_delta":
+                            delta = getattr(event, "delta", None)
+                            if delta:
+                                delta_type = getattr(delta, "type", None)
+                                if delta_type == "text_delta":
+                                    text = getattr(delta, "text", "")
+                                    if text and not has_tool_use:
+                                        _fire_first_delta()
+                                        self._fire_stream_delta(text)
+                                        deltas_were_sent["yes"] = True
+                                elif delta_type == "thinking_delta":
+                                    thinking_text = getattr(delta, "thinking", "")
+                                    if thinking_text:
+                                        _fire_first_delta()
+                                        self._fire_reasoning_delta(thinking_text)
 
                 # Return the native Anthropic Message for downstream processing
                 return stream.get_final_message()
